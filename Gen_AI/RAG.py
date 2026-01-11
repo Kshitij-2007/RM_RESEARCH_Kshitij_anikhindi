@@ -6,7 +6,9 @@ import numpy as np
 import json
 import time
 import logging
-import os
+import nltk
+from gensim.models import Word2Vec
+from nltk.tokenize import word_tokenize
 
 # logging
 logging.basicConfig(
@@ -26,14 +28,37 @@ documents = [
     "Retrieval Augmented Generation reduces hallucinations by grounding answers in retrieved documents.",
     "RAG retrieves relevant information before generating a response."
 ]
-# embedding
-def embed_text(texts):
-    result = client.models.embed_content(
-        model="models/embedding-001",
-        contents=texts
-    )
-    return np.array([e.values for e in result.embeddings])
-doc_embeddings = embed_text(documents)
+# tokenizer download
+import nltk
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+# token making
+tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
+
+w2v_model = Word2Vec(
+    sentences=tokenized_docs,
+    vector_size=100,
+    window=5,
+    min_count=1,
+    workers=4
+)
+def embed_document(text):
+    tokens = word_tokenize(text.lower())
+    vectors = []
+
+    for word in tokens:
+        if word in w2v_model.wv:
+            vectors.append(w2v_model.wv[word])
+
+    if not vectors:
+        return np.zeros(w2v_model.vector_size)
+
+    return np.mean(vectors, axis=0)
+
+# embed all documents
+doc_embeddings = np.array([embed_document(doc) for doc in documents])
+
 # semantic search
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -41,16 +66,12 @@ def cosine_similarity(a, b):
 input_user = input("You: ")
 logging.info("User input received")
 # retrieval
-query_embedding = embed_text([input_user])[0]
-
+query_embedding = embed_document(input_user)
 scores = [cosine_similarity(query_embedding, d) for d in doc_embeddings]
-
 k = 2
 top_k_indices = np.argsort(scores)[-k:][::-1]
 retrieved_docs = [documents[i] for i in top_k_indices]
-
 context = "\n".join(retrieved_docs)
-
 logging.info("Retrieved %d relevant documents", k)
 # prompt structuring
 prompt = f"""
