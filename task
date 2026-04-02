@@ -1,0 +1,274 @@
+# Sparse-FCL: Federated Continual Learning on CIFAR-10
+
+**Author:** Kshitij  
+**Framework:** PyTorch (Google Colab)  
+**Dataset:** CIFAR-10  
+**File:** `sparse_fcl_fixed.ipynb`
+
+---
+
+## What Is This Project?
+
+This notebook implements a system called **Sparse-FCL** — a combination of three techniques: **Federated Learning (FL)**, **Dynamic Sparse Training (DST)**, and **Elastic Weight Consolidation (EWC)** — all working together to train a neural network on multiple tasks sequentially without it forgetting what it previously learned. This problem is known as **Catastrophic Forgetting**, and it's one of the main open challenges in Continual Learning.
+
+The model is also designed to be deployed on **edge devices** (like phones or IoT sensors), so efficiency — both in terms of compute and communication — is a primary concern.
+
+---
+
+## The Problem Being Solved
+
+Imagine you train a neural network to recognise 5 animals (Task 1). Then you train it on 5 vehicles (Task 2). A standard neural network will basically "forget" the animals entirely — that's catastrophic forgetting.
+
+Now make it harder: instead of training on one central machine, you have **10 different clients** (simulating IoT or mobile devices) that each only see a portion of the data, and they communicate with a shared global model. That's federated learning.
+
+This project tries to solve both problems at once.
+
+---
+
+## Dataset Split
+
+CIFAR-10 has 10 classes. This notebook splits them into two sequential tasks:
+
+| Task | Classes |
+|------|---------|
+| Task 1 | airplane, automobile, bird, cat, deer (classes 0–4) |
+| Task 2 | dog, frog, horse, ship, truck (classes 5–9) |
+
+---
+
+## Key Hyperparameters
+
+| Parameter | Value | What It Does |
+|-----------|-------|--------------|
+| `NUM_CLIENTS` | 10 | Number of simulated edge devices |
+| `FL_ROUNDS` | 10 | How many rounds of communication per task |
+| `LOCAL_EPOCHS` | 5 | How many epochs each client trains locally per round |
+| `BATCH_SIZE` | 128 | Samples per gradient update |
+| `SPARSITY` | 0.90 | 90% of weights are zeroed out (only top 10% survive) |
+| `DIRICHLET_ALPHA` | 10.0 | Controls how non-uniform the data is across clients |
+| `EWC_LAMBDA` | 5000 | How strongly we penalise forgetting Task 1 during Task 2 |
+| `LR` | 1e-3 | Adam learning rate |
+
+---
+
+## Notebook Structure — What Each Section Does
+
+### Section 1 — Setup and Imports
+Installs `torchvision`, `onnx`, and `onnxruntime`. Sets the random seeds for reproducibility and detects whether a GPU is available.
+
+---
+
+### Section 2 — Dataset and Non-IID Dirichlet Split
+Downloads CIFAR-10 and splits it into Task 1 and Task 2 subsets.
+
+Each task's training data is then distributed across 10 clients using a **Dirichlet distribution** (`α = 10`). This simulates a real federated scenario where each device has a different, non-uniform sample of the data — some clients may have mostly one class, others a mix. This is called a **Non-IID** (non-independent and identically distributed) setting.
+
+---
+
+### Section 3 — Model Architecture (6-layer CNN)
+
+The model is a **6-layer Convolutional Neural Network** designed to match the paper's specification:
+
+```
+Input (3×32×32)
+  → Conv(3→64, 3×3) + BN + ReLU
+  → Conv(64→64, 3×3) + BN + ReLU + MaxPool   [32×32 → 16×16]
+  → Conv(64→128, 3×3) + BN + ReLU
+  → Conv(128→128, 3×3) + BN + ReLU + MaxPool [16×16 → 8×8]
+  → Flatten → FC(8192→1024)
+  → FC(1024→10) ← Task Mask applied here
+```
+
+A **task mask** is applied at the output layer — it forces the model to only output predictions for the classes relevant to the current task (0–4 for Task 1, 5–9 for Task 2). This prevents the model from "accidentally" predicting Task 2 classes during Task 1 training and vice versa.
+
+---
+
+### Section 4 — Sparsity Engine (Dynamic Sparse Training)
+
+This section implements the "sparse" part of Sparse-FCL.
+
+**`apply_sparsity_mask()`** — Takes the model and zeros out the bottom 90% of weights by magnitude. Only the top 10% (by absolute value) remain active. This gives us a **sparse network** that is much lighter to communicate and deploy.
+
+**`regrow_weights()`** — After each federated round, a small fraction (10%) of the dead (zeroed) weights are randomly reactivated with small values. This lets the network explore new sparse "topologies" over time, which is the "Dynamic" part of DST.
+
+Together these two functions ensure the model stays exactly 90% sparse throughout training while still being able to adapt.
+
+---
+
+### Section 5 — EWC (Elastic Weight Consolidation)
+
+This is the mechanism that prevents forgetting Task 1 when we train on Task 2.
+
+**`compute_fisher()`** — After Task 1 training is complete, we calculate the **Fisher Information Matrix** (diagonal approximation). For each weight, this tells us how important that weight was for Task 1. Weights with a high Fisher value are ones where a small change would cause a big drop in Task 1 accuracy.
+
+**`ewc_penalty()`** — During Task 2 training, we add an extra term to the loss function:
+
+```
+Total Loss = CrossEntropy(Task 2) + λ/2 × Σ F_i × (θ_i - θ*_i)²
+```
+
+This penalises the model for moving weights that were important for Task 1 far from where they were after Task 1 training (`θ*`). The hyperparameter `EWC_LAMBDA = 5000` controls how strongly we enforce this.
+
+---
+
+### Section 6 — Federated Aggregation (FedAvg)
+
+**`federated_average()`** — After all 10 clients train locally, their model weights are aggregated using **weighted FedAvg**. Each client's contribution is weighted by the size of its local dataset. The result becomes the new global model.
+
+Because the model is 90% sparse, only the non-zero weights actually need to be transmitted — giving approximately **80% communication reduction** compared to transmitting a dense model.
+
+---
+
+### Section 7 — Task-Adaptive Topology Exploration
+
+Before starting Task 2 training, the notebook checks whether Task 1 and Task 2 are "similar" tasks by comparing their **mean fc1 layer activations** using **cosine similarity**.
+
+- If cosine similarity ≥ 0.7 → tasks are similar → reuse the existing sparse topology (knowledge transfer)
+- If cosine similarity < 0.7 → tasks are different → **rewire** the plastic (less important) neurons while preserving the stable ones from Task 1
+
+**`select_stable_neurons()`** identifies the top 30% most consistently activated neurons in fc1 across Task 1 data. These are "frozen" during the rewiring step.
+
+**`topology_rewire()`** randomly reinitialises the remaining (less important) neurons to allow the network to adapt its sparse structure for Task 2.
+
+---
+
+### Section 8 — Local Training Loop
+
+**`local_train()`** runs the actual training on each client. Key behaviours:
+
+- Applies the task mask on every forward pass
+- If Fisher and anchor weights are provided (Task 2 only), adds the EWC penalty to the loss
+- After every optimizer step, re-enforces the sparsity mask so pruned weights never come back through gradients
+- Uses half the learning rate for Task 2 (`LR * 0.5`) to be more conservative
+
+---
+
+### Section 9 — Task 1 Federated Training
+
+Runs the full federated training loop for Task 1:
+
+1. For each of the 10 FL rounds:
+   - Each of the 10 clients gets a copy of the global model
+   - Each client runs 5 local epochs of training on its own data partition
+   - All client models are aggregated using FedAvg
+   - Sparsity masks are recomputed and dead weights are regrown (DST step)
+2. The final model is saved as `model_task1.pth`
+
+---
+
+### Section 10 — EWC Setup and Topology Check (Between Tasks)
+
+This happens between Task 1 and Task 2 training:
+
+1. Compute the Fisher Information Matrix over 2000 Task 1 training samples
+2. Save the current weights as the EWC "anchor" (`theta_star`)
+3. Identify stable neurons in fc1
+4. Compare Task 1 and Task 2 activation patterns (cosine similarity)
+5. Either reuse topology or rewire based on the similarity threshold
+
+---
+
+### Section 11 — Task 2 Federated Training (with EWC)
+
+Same federated loop as Task 1, but now:
+- EWC penalty is active (uses `fisher_t1` and `theta_star_t1`)
+- Learning rate is halved
+- The rewired (or reused) masks are used to enforce sparsity
+
+The final model is saved as `model_task2.pth`.
+
+---
+
+### Section 12 — Evaluation
+
+After both tasks are trained, the notebook evaluates:
+
+| Metric | What It Measures |
+|--------|-----------------|
+| Task 1 acc after Task 1 | Baseline — how well the model learned Task 1 |
+| Task 1 acc after Task 2 | Whether the model forgot Task 1 (catastrophic forgetting) |
+| Task 2 acc | How well Task 2 was learned |
+| Forgetting | `acc_t1_before − acc_t1_after` (lower is better) |
+| Actual sparsity | Verified by counting zero weights directly |
+
+Three plots are generated and saved as `results.png`:
+- Loss curves for both tasks across FL rounds
+- Accuracy bar chart (Task 1 before/after, Task 2)
+- Catastrophic forgetting bar chart
+
+---
+
+### Section 13 — ONNX Export for Edge Deployment
+
+Two ONNX models are exported — one for each task — with the task mask **baked in** as a constant buffer. This means the edge device runs a clean forward pass with no dynamic logic at inference time.
+
+A `MaskedModel` wrapper is used for this. An important fix here is using `copy.deepcopy()` before calling `.cpu()` — if you call `.cpu()` directly on the original model, PyTorch moves the original in-place and corrupts the GPU model for the rest of the session.
+
+**Optional INT8 Quantisation** — The ONNX models are then quantised to INT8 using `onnxruntime.quantization`. This gives approximately 3–4× smaller model size and ~2× faster inference, with less than 1% accuracy drop. Very useful for resource-constrained devices.
+
+---
+
+### Section 14 — TorchScript / Mobile Export
+
+A `FullModel` wrapper (no task mask, all 10 classes active) is traced using `torch.jit.trace()` and saved with `_save_for_lite_interpreter()` as `model_all10_mobile.ptl`. This is the format used by **PyTorch Mobile** on Android.
+
+---
+
+### Section 15 — Edge Inference Demo
+
+Runs a quick benchmark using ONNX Runtime's CPU provider:
+- Loads a single test image
+- Runs inference 200 times and measures average latency in ms/image
+- Displays the image with prediction vs. ground truth label
+- Estimates FPS
+
+---
+
+### Section 16 — Final Summary
+
+Prints a formatted summary table with all key metrics and lists all output files with their sizes:
+
+- `model_task1.pth`, `model_task2.pth` — PyTorch checkpoints
+- `model_task1_edge.onnx`, `model_task2_edge.onnx` — ONNX FP32 models
+- `model_task1_edge_int8.onnx`, `model_task2_edge_int8.onnx` — ONNX INT8 quantised
+- `model_all10_mobile.ptl` — PyTorch Mobile Lite model
+- `results.png` — plots
+
+---
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `model_task1.pth` | PyTorch weights after Task 1 training |
+| `model_task2.pth` | PyTorch weights after Task 2 training |
+| `model_task1_edge.onnx` | ONNX model for Task 1 (FP32, mask baked in) |
+| `model_task2_edge.onnx` | ONNX model for Task 2 (FP32, mask baked in) |
+| `model_task1_edge_int8.onnx` | INT8 quantised ONNX for Task 1 |
+| `model_task2_edge_int8.onnx` | INT8 quantised ONNX for Task 2 |
+| `model_all10_mobile.ptl` | PyTorch Mobile Lite model (all 10 classes) |
+| `results.png` | Loss curves + accuracy + forgetting plots |
+
+---
+
+## Known Issue — Catastrophic Forgetting
+
+One thing to watch out for: if Task 1 accuracy drops to **0%** after Task 2 training, it likely means the EWC penalty is not being applied correctly during Task 2, or the `fisher_t1` and `theta_star_t1` variables were not passed into `local_train()`. The `ewc_penalty()` function must be called inside the training loop and the result must be added to the loss — not just computed and discarded.
+
+---
+
+## How to Run
+
+1. Open the notebook in **Google Colab**
+2. Enable GPU runtime: `Runtime → Change runtime type → T4 GPU`
+3. Run all cells in order (`Runtime → Run all`)
+4. Download `model_all10_mobile.ptl` from the final cell for Android deployment
+
+---
+
+## Dependencies
+
+- `torch`, `torchvision`
+- `onnx`, `onnxruntime`
+- `numpy`, `matplotlib`
+- `google.colab` (for file download)
